@@ -51,27 +51,30 @@ Thread#interrupt()
 Thread#isInterrupted() 获取打断标记，不会清除打断标记，Thread.interrupted() static方法，获取打断标记并清除标记。
 
 在线程A中优雅地终止线程B，使用interrupt()设置打断标记，线程循环地检测是否设置了打断标记
+//使用volatile变量存储是否停止运行，在线程B中的执行中循环判断该变量是否满足退出的条件，如果线程中使用了Thread.sleep(#)，可以再调用interrupt打断。
 B{
-Thread t;
-    start(){
+    Thread t;
+    volatile boolean stop = false;
+
+    public void start(){
         t = new Thread(()->{
             Thread currentThread = Thread.currentThread();
-            while(true){
-                if (currentThread.isInterrupted()){
-                    break;
-                }else{
-                    try{
-                        TimeUnit.SECOND.sleep(10);
-                    } catch(InterruptedException  e){
-                    //如果stop()时抛出InterruptedException，重置打断标记，则再次设置打断标记，此时不会被重置
-                        currentThread.interrupt();
-                    }
+            while(!stop){
+                //业务代码
+
+                //线程可能需要等一段时间再执行
+                try{
+                    TimeUnit.SECOND.sleep(10);
+                } catch(InterruptedException  e){
+
                 }
+
             }
         },"Thread_B");
         t.start();
     }
-    stop(){
+    public void stop(){
+        stop = true;
         t.interrupt();
     }
 }
@@ -82,7 +85,13 @@ LockSupport.park()/parkUntil(ms)/parkNanos(nanos)
 解除阻塞的条件：当使用LockSupport.unpark(Thread)/或者Thread.interrupt()/经过指定的等待时间/无故调用返回
 实现使用了Unsafe#park(boolean,long)方法：
 sun.misc.Unsafe#park(boolean,long)：第一个参数true则第二个参数单位为ms，第一个参数false则第二个参数单位为ns。
-UNSAFE对象的获取：sun.misc.Unsafe UNSAFE = sun.misc.Unsafe.getUnsafe()
+UNSAFE对象的获取：
+//Unsafe unsafe = Unsafe.getUnsafe(); //throwed java.lang.SecurityException: Unsafe
+//getDeclaredField获取所有的字段 getField获取public的字段
+Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
+theUnsafe.setAccessible(true);
+Unsafe unsafe =(Unsafe) theUnsafe.get(null);
+
 
 LockSupport.unpark(Thread)
 如果指定线程的许可证不可用，则使它可用；此时，如果该线程因调用park方法阻塞则unblock。
@@ -182,7 +191,7 @@ sleep(#)和wait(#)都会使线程进入TIME_WAITING状态。
 
 死锁：线程需要获取多个锁，而多个运行的线程互相抢占线程的锁，造成多个线程无法获得锁而阻塞
 活锁：多个运行的线程相互破坏线程结束的条件，造成多个线程无法结束
-锁饥饿：
+饥饿：由于某线程的优先度较低或者在多个线程随机竞争锁的过程中一直分配不到CPU时间片而造成线程无法运行
 
 
 ReentrantLock和synchronized的区别
@@ -195,15 +204,62 @@ ReentrantLock和synchronized的区别
 
 调用await()/signal() 和wait()/notify()同样需要先获取对应的锁，否则抛出IllegalMonitorStateException
 
-ReentrantLock用法：
+ReentrantLock基本用法：
 
 ReentrantLock lock = new ReentrantLock();
-//创建条件变量
+//创建条件变量,如果需要用到的话
 Condition condition = lock.newCondition();
 lock.lock();
 try{
-//业务代码 //或者condition.await()/signal()/signalAll()
+    //业务代码 //或者condition.await()/signal()/signalAll()
+}finally{
+    lock.unlock();
 }
-finally{
-lock.unlock();
+
+原子性/可见性/有序性
+
+volatile：可见性/有序性
+synchronized:原子性/可见性
+
+
+原子操作：不可中断的一个或一系列操作。Java中可以通过锁和CAS实现原子操作。
+
+结合CAS+volatile可以实现无锁并发，适用于线程数较少、多核CPU的场景中。(CAS自旋的线程虽然不会进入阻塞状态，但仍会由于分配不到时间片而导致上下文切换。)
+
+
+
+AtomicStampedReference(里面版本号用的是int stamp变量)/AtomicMarkableReference(里面版本号用的是boolean mark变量)
+AtomicStampedReference：
+public boolean compareAndSet(V   expectedReference,
+                                 V   newReference,
+                                 int expectedStamp,
+                                 int newStamp) {
+    Pair<V> current = pair;
+    return
+        expectedReference == current.reference &&
+        expectedStamp == current.stamp &&
+        ((newReference == current.reference &&
+          newStamp == current.stamp) ||
+         casPair(current, Pair.of(newReference, newStamp)));
 }
+
+AtomicIntegerArray/AtomicLongArray/AtomicReferenceArray：原子数组类
+
+
+AtomicIntegerFieldUpdater/AtomicLongFieldUpdater/AtomicReferenceFieldUpdater:原子字段更新器(对于字段的数据类型选择对应的字段更新器类)
+需要通过调用静态方法AtomicReferenceFieldUpdater<U,W> newUpdater(Class<U> tclass,Class<W> vclass,String fieldName)获取
+注意：修改字段必须加上volatile关键字修饰。：@throws IllegalArgumentException if the field is not volatile
+
+
+DoubleAdder/LongAddr:累加器
+性能比AtomicLong提升，基本原理就是：在有竞争时，设置多个累加单元Cell，不同的线程累加不同的Cell，最后将结果汇总。通过设置多个累加单元，使得多个线程CAS时减少重试次数。
+
+CAS实现原子操作的三个问题：
+1.ABA问题：解决思路是使用版本号，更新时compareAndSet需要指定expectedValue,expectedVersion，newValue,newVersion四个值，首先检查expectedValue是否等于currentValue，并且检查expectedVersion是否等于currentVersion,如果全部相等，则使用newValue更新值和newVersion更新版本号。
+AtomicStampedReference(里面版本号用的是int stamp变量)/AtomicMarkableReference(里面版本号用的是boolean mark变量)
+2.自旋时间长开销大
+3.只能保证一个共享变量的原子操作：解决思路是将多个共享变量合并为一个共享变量。AtomicReference类。
+
+Java内存模型
+在Java中，所有的实例域、静态域和数组元素都存储在堆内存中，堆内存在线程中共享。
+JMM定义了线程与主内存之间的抽象关系：线程之间的共享变量存储在主内存中，每个线程有自己的本地内存，本地内存中存储了该线程用于读写共享变量的副本。
