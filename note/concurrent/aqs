@@ -456,14 +456,20 @@ G
 public final void await() throws InterruptedException {
     if (Thread.interrupted())
         throw new InterruptedException();
+        //G1： 移除队列中的非CONDITION的node，添加当前线程node到CONDITION队列中
     Node node = addConditionWaiter();
+    //G2 
     int savedState = fullyRelease(node);
     int interruptMode = 0;
+    //判断该节点是否在SIGNAL队列中， 加这个判断的原因是：
+    //当其他线程调用signal/signalAll会把当前node添加到SIGNAL队列的队尾，当当前线程被unpark后检查isOnSyncQueue后跳出循环
     while (!isOnSyncQueue(node)) {
+    //阻塞当前线程
         LockSupport.park(this);
         if ((interruptMode = checkInterruptWhileWaiting(node)) != 0)
             break;
     }
+    //使用savedState重新竞争同步状态，以恢复以前重入锁后的state
     if (acquireQueued(node, savedState) && interruptMode != THROW_IE)
         interruptMode = REINTERRUPT;
     if (node.nextWaiter != null) // clean up if cancelled
@@ -472,18 +478,93 @@ public final void await() throws InterruptedException {
         reportInterruptAfterWait(interruptMode);
 }
 
-//待完善
+G1
+private Node addConditionWaiter() {
+    Node t = lastWaiter;
+    // If lastWaiter is cancelled, clean out.
+    if (t != null && t.waitStatus != Node.CONDITION) {
+    //遍历队列，移除所有的非CONDITION的node
+        unlinkCancelledWaiters();
+        t = lastWaiter;
+    }
+    //添加到当前线程的node，waitStatus=Node.CONDITION
+    Node node = new Node(Thread.currentThread(), Node.CONDITION);
+    if (t == null)
+        firstWaiter = node;
+    else
+        t.nextWaiter = node;
+    lastWaiter = node;
+    return node;
+}
+
+G2 
+final int fullyRelease(Node node) {
+    boolean failed = true;
+    try {
+    	//获取当前state，当前线程可能锁重入，
+        int savedState = getState();
+        if (release(savedState)) {
+            failed = false;
+            return savedState;
+        } else {
+            throw new IllegalMonitorStateException();
+        }
+    } finally {
+        if (failed)
+            node.waitStatus = Node.CANCELLED;
+    }
+}
 
 
+H
+public final void signal() {
+    if (!isHeldExclusively())
+        throw new IllegalMonitorStateException();
+    Node first = firstWaiter;
+    if (first != null)
+    //H1
+        doSignal(first);
+}
+
+H1
+private void doSignal(Node first) {
+    do {
+        if ( (firstWaiter = first.nextWaiter) == null)
+            lastWaiter = null;
+        first.nextWaiter = null;
+        //H1-1 由于transferForSignal返回true而只是对firstWaiter的线程进行signal
+    } while (!transferForSignal(first) &&
+             (first = firstWaiter) != null);
+}
+
+//对比doSignalAll
+private void doSignalAll(Node first) {
+    lastWaiter = firstWaiter = null;
+    do {
+        Node next = first.nextWaiter;
+        first.nextWaiter = null;
+        transferForSignal(first);
+        first = next;
+    } while (first != null);
+}
+
+H1-1
+final boolean transferForSignal(Node node) {
+   
+    if (!compareAndSetWaitStatus(node, Node.CONDITION, 0))
+        return false;
+    //将node入阻塞队列
+    Node p = enq(node);
+    //ws=0
+    int ws = p.waitStatus;
+    if (ws > 0 || !compareAndSetWaitStatus(p, ws, Node.SIGNAL))
+    //唤醒因await()而WAIT的线程
+        LockSupport.unpark(node.thread);
+    return true;
+}	
 
 
-
-
-
-
-
-
-
+以上分析了ReentrantLock的主要方法以及Condition的主要方法的的源码流程，后续再补充ReentrantReadWriteLock的分析
 
 
 
@@ -508,7 +589,8 @@ AQS是用来构建锁或者其他同步组件的基础框架，主要的成员�
 -volatile Node head;
 -volatile Node tail;
 
-
+AQS：Node head Node tail :同步队列
+ConditionObject：Node firstWaiter-Node lastWaiter ：等待队列
 
 同步器可重写的方法
 //独占式获取同步状态
@@ -522,3 +604,85 @@ AQS是用来构建锁或者其他同步组件的基础框架，主要的成员�
 //是否同步器在独占模式被当前线程占用
 -boolean isHeldExclusively()
 
+ReentrantReadWriteLock
+
+ReentrantReadWriteLock rw = new ReentrantReadWriteLock();
+ReentrantReadWriteLock.ReadLock rL = rw.readLock();
+ReentrantReadWriteLock.WriteLock wL = rw.writeLock();
+
+注意：
+不支持锁重入的锁升级：获取readLock之后，需要对rL解锁后，才能获取writeLock。
+支持锁重入的锁降级：获取writeLock之后，可以再获取readLock，再释放wL，最后再释放rL。分析：如果线程A对修改数据的操作而加上写锁，当前线程需要进行读取数据，则需要在写锁释放前加上读锁。否则，
+如果此时有另外的线程B加上写锁进行数据更新，则由于线程A和线程B并发而可能造成线程A获取不到线程B更新后的数据。因此，线程A加上读锁降级时，线程B无法更新数据而不会造成数据不一致。
+由源码可知ReadLock不支持newCondition()
+
+ReentrantReadWriteLock 对int state变量的高16位作为读锁的占用计数，低16位作为写锁的占用计数。
+
+WriteLock.lock
+WriteLock的tryAcquire，写锁使用state的低16位
+protected final boolean tryAcquire(int acquires) {
+ 
+    Thread current = Thread.currentThread();
+    
+    int c = getState();
+    //获取写锁的count
+    int w = exclusiveCount(c);
+    if (c != 0) {
+    		//如果c!=0，可能是一个或多个线程加上读锁，可能是一个线程加上写锁
+    		//w==0 表示加的是读锁
+        if (w == 0 || current != getExclusiveOwnerThread())
+            return false;
+        if (w + exclusiveCount(acquires) > MAX_COUNT)
+            throw new Error("Maximum lock count exceeded");
+       	//写锁的重入
+        setState(c + acquires);
+        return true;
+    }
+    //writerShouldBlock(): 非公平则返回false，公平则检查hasQueuedPredecessors()
+    if (writerShouldBlock() ||
+        !compareAndSetState(c, c + acquires))
+        return false;
+    setExclusiveOwnerThread(current);
+    return true;
+}
+
+
+ReadLock.lock
+
+public void lock() {
+    sync.acquireShared(1);
+}
+
+public final void acquireShared(int arg) {
+    if (tryAcquireShared(arg) < 0)
+        doAcquireShared(arg);
+}
+
+protected final int tryAcquireShared(int unused) {
+    Thread current = Thread.currentThread();
+    int c = getState();
+    //如果当前加的是写锁，进一步检查当前线程是否为ExclusiveOwnerThread，(锁降级)
+    if (exclusiveCount(c) != 0 &&
+        getExclusiveOwnerThread() != current)
+        return -1;
+    int r = sharedCount(c);
+    if (!readerShouldBlock() &&
+        r < MAX_COUNT &&
+        compareAndSetState(c, c + SHARED_UNIT)) {
+        if (r == 0) {
+            firstReader = current;
+            firstReaderHoldCount = 1;
+        } else if (firstReader == current) {
+            firstReaderHoldCount++;
+        } else {
+            HoldCounter rh = cachedHoldCounter;
+            if (rh == null || rh.tid != getThreadId(current))
+                cachedHoldCounter = rh = readHolds.get();
+            else if (rh.count == 0)
+                readHolds.set(rh);
+            rh.count++;
+        }
+        return 1;
+    }
+    return fullTryAcquireShared(current);
+}

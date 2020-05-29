@@ -138,12 +138,12 @@ monitor:synchronized重量级锁使用 当升级为重量级锁时，mark word�
 当owner线程执行完同步代码块，便会通知monitor唤醒EntryList中的线程来竞争锁。如果成功竞争到锁的线程则owner指向该线程，竞争锁失败的线程重新回到EntryList中。
 当线程执行完同步代码块时，使用monitor中的存储的mark word信息进行重置锁对象的mark word。
 
-Lock Record:锁记录，轻量级锁使用，线程的每个栈帧中都会维护着一个Lock Record，
+Lock Record:锁记录，轻量级锁使用，此时每个线程都会维护着保存Lock Record信息的栈
 Lock Record维护着 Object Reference(即synchronized括号的对象/同步方法的Class对象的引用)/ mark word(Object header中的信息)
 流程：执行到synchronized代码块时，加锁，让锁记录的Object Reference指向锁对象，并尝试CAS替换Object的Mark word为当前的锁记录的地址。如果CAS替换成功，则将Object的mark word保存到锁记录中。
 此时，锁对象的mark word中存储着当前的锁记录的地址，表示该线程持有锁。如果CAS失败，有两种情况：
 如果是其他线程持有该对象的锁，则进入锁膨胀过程；
-如果是自己所在线程占用锁，则是锁重入，将当前栈帧的锁记录的mark word置为null，并添加当前的锁记录作为重入计数
+如果是自己所在线程占用锁，则表示锁重入，将当前栈帧的锁记录的mark word置为null，并添加当前的锁记录到Lock Record栈中，markword=null可作为重入计数的标识
 当退出synchronized，解锁，如果锁记录的mark word为null，则表示锁重入，将重入计数减一，
 如果不为null，则CAS重置锁对象的mark word，如果成功则使用锁记录中的mark word信息重置Object的mark word，如果失败则进入重量级锁的解锁过程。
 
